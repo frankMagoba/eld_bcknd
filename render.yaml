@@ -4,7 +4,7 @@ services:
     plan: free
     runtime: python
     buildCommand: ./build.sh
-    startCommand: cd $RENDER_PROJECT_DIR && gunicorn --chdir eld_log eld_log.wsgi:application
+    startCommand: python manage.py runserver
     envVars:
       - key: DATABASE_URL
         sync: false

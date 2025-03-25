@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: eld-log-api
+    plan: free
+    runtime: python
+    buildCommand: ./build.sh
+    startCommand: gunicorn eld_log.wsgi:application
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: 3.11.3
+      - key: WEB_CONCURRENCY
+        value: 4
+      - key: DJANGO_SETTINGS_MODULE
+        value: eld_log.settings
+      - key: DEBUG
+        value: false 

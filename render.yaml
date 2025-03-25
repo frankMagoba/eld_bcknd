@@ -4,7 +4,7 @@ services:
     plan: free
     runtime: python
     buildCommand: ./build.sh
-    startCommand: gunicorn wsgi:application
+    startCommand: gunicorn app:app
     envVars:
       - key: DATABASE_URL
         sync: false

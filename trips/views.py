@@ -89,6 +89,34 @@ class HOSCalculationView(APIView):
             type=openapi.TYPE_INTEGER,
             description="ID of the trip to generate a log for",
             required=True
+        ),
+        openapi.Parameter(
+            name='carrier_name',
+            in_=openapi.IN_QUERY,
+            type=openapi.TYPE_STRING,
+            description="Name of the carrier company",
+            required=False
+        ),
+        openapi.Parameter(
+            name='office_address',
+            in_=openapi.IN_QUERY,
+            type=openapi.TYPE_STRING,
+            description="Main office address",
+            required=False
+        ),
+        openapi.Parameter(
+            name='vehicle_number',
+            in_=openapi.IN_QUERY,
+            type=openapi.TYPE_STRING,
+            description="Truck or tractor and trailer number",
+            required=False
+        ),
+        openapi.Parameter(
+            name='co_driver_name',
+            in_=openapi.IN_QUERY,
+            type=openapi.TYPE_STRING,
+            description="Name of co-driver (if applicable)",
+            required=False
         )
     ],
     responses={
@@ -113,6 +141,10 @@ def generate_log(request):
     
     Query Parameters:
         trip_id: ID of the trip to generate a log for
+        carrier_name: Name of the carrier company
+        office_address: Main office address
+        vehicle_number: Truck or tractor and trailer number
+        co_driver_name: Name of co-driver (if applicable)
     
     Returns:
         JSON with base64 encoded PDF data
@@ -133,9 +165,21 @@ def generate_log(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
+    # Get optional parameters with defaults
+    carrier_name = request.query_params.get('carrier_name', 'Transport Company')
+    office_address = request.query_params.get('office_address', '123 Trucking Lane, Anytown, USA')
+    vehicle_number = request.query_params.get('vehicle_number', '')
+    co_driver_name = request.query_params.get('co_driver_name', '')
+    
     try:
-        # Generate PDF using our service
-        pdf_data = PDFGenerator.generate_trip_log(trip_id)
+        # Generate PDF using our service with additional parameters
+        pdf_data = PDFGenerator.generate_trip_log(
+            trip_id=trip_id,
+            carrier_name=carrier_name,
+            office_address=office_address,
+            vehicle_number=vehicle_number,
+            co_driver_name=co_driver_name
+        )
         
         # Convert PDF to base64
         import base64

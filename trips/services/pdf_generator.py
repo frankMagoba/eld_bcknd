@@ -6,8 +6,9 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch, mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Flowable
 from reportlab.pdfgen import canvas
+from PyPDF2 import PdfMerger
 
 from ..models import Trip
 from ..utils.hos_calculator import HOSCalculator
@@ -32,16 +33,28 @@ class PDFGenerator:
         "REMARKS"
     ]
     
-    def __init__(self, trip: Trip, schedule_data: Optional[Dict[str, Any]] = None):
+    def __init__(self, trip: Trip, schedule_data: Optional[Dict[str, Any]] = None, 
+                 carrier_name: str = "Transport Company", 
+                 office_address: str = "123 Trucking Lane, Anytown, USA",
+                 vehicle_number: str = "",
+                 co_driver_name: str = ""):
         """
         Initialize the PDF Generator.
         
         Args:
             trip: The Trip model instance
             schedule_data: Optional precomputed schedule data (if None, will be calculated)
+            carrier_name: Name of the carrier company
+            office_address: Main office address
+            vehicle_number: Truck or tractor number
+            co_driver_name: Name of co-driver, if applicable
         """
         self.trip = trip
         self.schedule_data = schedule_data
+        self.carrier_name = carrier_name
+        self.office_address = office_address
+        self.vehicle_number = vehicle_number
+        self.co_driver_name = co_driver_name
         
         # If schedule data not provided, calculate it using the HOS calculator
         if not self.schedule_data:
@@ -64,7 +77,98 @@ class PDFGenerator:
     def generate_pdf(self) -> bytes:
         """
         Generate a driver log PDF with FMCSA-compliant log grid.
+        For trips spanning multiple days, generates multiple log sheets.
         
+        Returns:
+            PDF file as bytes
+        """
+        # Determine if we need multiple log sheets
+        segments = self._get_schedule_segments()
+        days_covered = self._get_days_covered(segments)
+        
+        if len(days_covered) <= 1:
+            # Just one day - generate a single log sheet
+            return self._generate_single_day_log(days_covered[0] if days_covered else datetime.now().date())
+        else:
+            # Multiple days - generate multiple log sheets and combine them
+            return self._generate_multi_day_logs(days_covered)
+    
+    def _get_schedule_segments(self) -> List[Dict[str, Any]]:
+        """
+        Extract schedule segments from the schedule data.
+        
+        Returns:
+            List of schedule segments (drive, rest, break periods)
+        """
+        if not self.schedule_data or 'schedule' not in self.schedule_data:
+            return []
+            
+        return self.schedule_data.get('schedule', [])
+    
+    def _get_days_covered(self, segments: List[Dict[str, Any]]) -> List[datetime.date]:
+        """
+        Determine which days are covered by the schedule segments.
+        
+        Args:
+            segments: Schedule segments to analyze
+            
+        Returns:
+            List of dates (sorted) that the segments cover
+        """
+        if not segments:
+            return [datetime.now().date()]
+            
+        # Get all unique days from segment start and end times
+        days_set = set()
+        
+        for segment in segments:
+            start_time = segment.get('start_time')
+            end_time = segment.get('end_time')
+            
+            if start_time:
+                days_set.add(start_time.date())
+            if end_time:
+                days_set.add(end_time.date())
+                
+        # Sort days chronologically
+        return sorted(list(days_set))
+    
+    def _generate_multi_day_logs(self, days: List[datetime.date]) -> bytes:
+        """
+        Generate multiple log sheets, one for each day, and combine them.
+        
+        Args:
+            days: List of days to generate logs for
+            
+        Returns:
+            Combined PDF as bytes
+        """
+        # Use PyPDF2 to merge multiple PDFs
+        merger = PdfMerger()
+        
+        for day in days:
+            # Generate log for this day
+            day_log = self._generate_single_day_log(day)
+            
+            # Add to the merger
+            merger.append(io.BytesIO(day_log))
+        
+        # Get the combined PDF
+        output = io.BytesIO()
+        merger.write(output)
+        merger.close()
+        
+        # Return the bytes
+        output.seek(0)
+        return output.getvalue()
+    
+    def _generate_single_day_log(self, day: datetime.date) -> bytes:
+        """
+        Generate a single day's log sheet.
+        
+        Args:
+            day: The date to generate the log for
+            
         Returns:
             PDF file as bytes
         """
@@ -80,21 +184,17 @@ class PDFGenerator:
             bottomMargin=0.5*inch
         )
         
-        # Get current date
-        today = datetime.now()
-        date_str = today.strftime("%m/%d/%Y")
-        
         # Content elements
         elements = []
         
         # Add header section matching the exact design
-        self._add_header(elements)
+        self._add_header(elements, day)
         
         # Add driver log grid
-        self._add_driver_log_grid(elements)
+        self._add_driver_log_grid(elements, day)
         
         # Add remarks section
-        self._add_remarks_section(elements)
+        self._add_remarks_section(elements, day)
         
         # Build the PDF
         doc.build(elements)
@@ -104,17 +204,31 @@ class PDFGenerator:
         buffer.close()
         
         return pdf_data
-    
-    def _add_header(self, elements: List) -> None:
-        """Add the header section to the PDF, matching the FMCSA log form."""
+
+    def _add_header(self, elements: List, day: datetime.date) -> None:
+        """
+        Add the header section to the PDF, matching the FMCSA log form.
+        
+        Args:
+            elements: List of elements to add to
+            day: The date for this log sheet
+        """
         styles = getSampleStyleSheet()
         normal_style = styles['Normal']
+        
+        # Format date fields
+        month = day.strftime("%m")
+        day_num = day.strftime("%d")
+        year = day.strftime("%Y")
+        
+        # Calculate miles driven for this day
+        miles_driven = self._calculate_miles_for_day(day)
         
         # Create date field
         date_label = Paragraph("Date", normal_style)
         date_field = Table(
             [
-                ["", "", ""],
+                [month, day_num, year],
                 ["(MONTH)", "(DAY)", "(YEAR)"]
             ],
             colWidths=[20*mm, 20*mm, 20*mm],
@@ -128,7 +242,7 @@ class PDFGenerator:
         # Create name of carrier field
         carrier_label = Paragraph("Name of carrier", normal_style)
         carrier_field = Table(
-            [[""]],
+            [[self.carrier_name]],
             colWidths=[60*mm],
             style=TableStyle([
                 ('LINEBELOW', (0, 0), (0, 0), 1, colors.black),
@@ -139,7 +253,7 @@ class PDFGenerator:
         # Create main office address field
         address_label = Paragraph("Main office address", normal_style)
         address_field = Table(
-            [[""]],
+            [[self.office_address]],
             colWidths=[60*mm],
             style=TableStyle([
                 ('LINEBELOW', (0, 0), (0, 0), 1, colors.black),
@@ -153,7 +267,7 @@ class PDFGenerator:
         # Total miles driving today field
         miles_label = Paragraph("Total miles driving today", normal_style)
         miles_field = Table(
-            [[""]],
+            [[f"{miles_driven:.1f}"]],
             colWidths=[40*mm],
             style=TableStyle([
                 ('LINEBELOW', (0, 0), (0, 0), 1, colors.black),
@@ -172,7 +286,7 @@ class PDFGenerator:
         # Truck/tractor number field
         vehicle_label = Paragraph("Truck or tractor and trailer number", normal_style)
         vehicle_field = Table(
-            [[""]],
+            [[self.vehicle_number]],
             colWidths=[60*mm],
             style=TableStyle([
                 ('LINEBELOW', (0, 0), (0, 0), 1, colors.black),
@@ -197,7 +311,7 @@ class PDFGenerator:
         # Co-driver field
         codriver_label = Paragraph("Name of co-driver", normal_style)
         codriver_field = Table(
-            [[""]],
+            [[self.co_driver_name]],
             colWidths=[60*mm],
             style=TableStyle([
                 ('LINEBELOW', (0, 0), (0, 0), 1, colors.black),
@@ -205,8 +319,11 @@ class PDFGenerator:
         )
         codriver_subtext = Paragraph("(NAME OF CO. DRIVER)", ParagraphStyle('CodriverSubtext', parent=normal_style, fontSize=6, alignment=1))
         
+        # Calculate total hours for this day
+        total_hours = self._calculate_total_hours_for_day(day)
+        
         # Total hours field
-        total_hours_label = Paragraph("TOTAL HOURS", ParagraphStyle('TotalHoursLabel', parent=normal_style, fontSize=8, alignment=1))
+        total_hours_label = Paragraph(f"TOTAL HOURS: {total_hours:.1f}", ParagraphStyle('TotalHoursLabel', parent=normal_style, fontSize=8, alignment=1))
         
         # Create the header layout to match the image exactly
         header_data = [
@@ -292,203 +409,241 @@ class PDFGenerator:
         
         elements.append(header_table)
         elements.append(Spacer(1, 5*mm))  # Add space after header
-    
-    def _calculate_status_hours(self, segments: List[Dict[str, Any]]) -> Dict[str, float]:
+
+    def _calculate_miles_for_day(self, day: datetime.date) -> float:
         """
-        Calculate the total hours spent in each status based on schedule segments.
+        Calculate the miles driven for a specific day.
         
         Args:
-            segments: The schedule segments to analyze
+            day: The day to calculate for
             
         Returns:
-            Dictionary mapping status types to total hours
+            Miles driven on that day
         """
-        status_hours = {status: 0.0 for status in self.STATUS_TYPES}
+        # Get segments for this day only
+        day_segments = self._get_segments_for_day(day)
         
-        for segment in segments:
-            segment_type = segment.get('type', '').lower()
+        # Sum up miles for driving segments
+        total_miles = 0.0
+        for segment in day_segments:
+            if segment.get('type', '').lower() == 'drive':
+                # Estimate miles based on segment duration (assuming average speed of 55 mph)
+                start_time = segment.get('start_time')
+                end_time = segment.get('end_time')
+                
+                if start_time and end_time:
+                    duration_hours = (end_time - start_time).total_seconds() / 3600.0
+                    # Assume average speed of 55 mph
+                    miles = duration_hours * 55.0
+                    total_miles += miles
+        
+        return total_miles
+    
+    def _calculate_total_hours_for_day(self, day: datetime.date) -> float:
+        """
+        Calculate the total hours for all activities on a specific day.
+        
+        Args:
+            day: The day to calculate for
+            
+        Returns:
+            Total hours on that day
+        """
+        # Get segments for this day only
+        day_segments = self._get_segments_for_day(day)
+        
+        # Sum up hours for all segments
+        total_hours = 0.0
+        for segment in day_segments:
             start_time = segment.get('start_time')
             end_time = segment.get('end_time')
             
-            if not segment_type or not start_time or not end_time:
-                continue
+            if start_time and end_time:
+                # Adjust times to be within this day only
+                day_start = datetime.combine(day, datetime.min.time())
+                day_end = datetime.combine(day, datetime.max.time())
                 
-            # Map the segment type to a status
-            status_mapping = {
-                'drive': 'Driving',
-                'break': 'Off Duty',
-                'rest': 'Off Duty',
-                'sleep': 'Sleeper Berth',
-                'on_duty': 'On Duty (Not Driving)',
-                'off_duty': 'Off Duty'
-            }
-            
-            status = status_mapping.get(segment_type)
-            if not status:
-                continue
+                # If segment starts before this day, use day start
+                if start_time.date() < day:
+                    start_time = day_start
+                    
+                # If segment ends after this day, use day end
+                if end_time.date() > day:
+                    end_time = day_end
                 
-            # Calculate hours spent in this segment
-            duration = end_time - start_time
-            hours = duration.total_seconds() / 3600.0
-            
-            # Add to the status hours
-            status_hours[status] += hours
-            
-        return status_hours
+                duration_hours = (end_time - start_time).total_seconds() / 3600.0
+                total_hours += duration_hours
+        
+        return total_hours
 
-    def _add_driver_log_grid(self, elements: List) -> None:
-        """Add the driver log grid section to match FMCSA format."""
-        # Create the grid table
-        grid_data = []
-        
-        # Add midnight/noon markers
-        hour_row = [""]  # First cell is empty
-        for hour in range(self.HOURS_IN_DAY + 1):
-            if hour == 0:
-                hour_marker = "Midnight"
-            elif hour == 12:
-                hour_marker = "Noon"
-            else:
-                hour_marker = str(hour)
-            hour_row.append(hour_marker)
-            
-        grid_data.append(hour_row)
-            
-        # Add status rows with grid
-        for status in self.STATUS_TYPES:
-            status_row = [status]
-            # Add empty cells for the grid
-            for _ in range(self.HOURS_IN_DAY + 1):
-                status_row.append("")
-            grid_data.append(status_row)
-            
-        # Define column widths - first column wider for labels
-        first_col_width = 25*mm
-        hour_col_width = self.GRID_WIDTH / self.HOURS_IN_DAY
-        col_widths = [first_col_width] + [hour_col_width] * (self.HOURS_IN_DAY + 1)
-        
-        # Define row heights - first row shorter for hour labels
-        first_row_height = 10*mm
-        status_row_height = self.GRID_HEIGHT / len(self.STATUS_TYPES)
-        remarks_row_height = 15*mm  # Make remarks row taller
-        
-        row_heights = [first_row_height]
-        for i in range(len(self.STATUS_TYPES)):
-            if self.STATUS_TYPES[i] == "REMARKS":
-                row_heights.append(remarks_row_height)
-            else:
-                row_heights.append(status_row_height)
-        
-        # Create grid table style with vertical and horizontal lines
-        grid_style = TableStyle([
-            # Align hour labels
-            ('ALIGN', (1, 0), (-1, 0), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            
-            # Format first column status labels
-            ('ALIGN', (0, 1), (0, -1), 'LEFT'),
-            ('FONT', (0, 1), (0, -1), 'Helvetica-Bold', 8),
-            
-            # Add grid lines
-            ('GRID', (1, 1), (-1, -2), 0.5, colors.black),
-            
-            # Add stronger vertical lines for 4-hour intervals
-            ('LINEAFTER', (4, 1), (4, -2), 1.0, colors.black),  # 4 AM
-            ('LINEAFTER', (8, 1), (8, -2), 1.0, colors.black),  # 8 AM
-            ('LINEAFTER', (12, 1), (12, -2), 1.0, colors.black),  # 12 PM
-            ('LINEAFTER', (16, 1), (16, -2), 1.0, colors.black),  # 4 PM
-            ('LINEAFTER', (20, 1), (20, -2), 1.0, colors.black),  # 8 PM
-            
-            # Add bottom border for REMARKS row
-            ('LINEBELOW', (0, -1), (-1, -1), 1.0, colors.black),
-        ])
-        
-        # Create the grid table
-        grid_table = Table(
-            grid_data,
-            colWidths=col_widths,
-            rowHeights=row_heights,
-            style=grid_style
-        )
-        
-        elements.append(grid_table)
-        
-        # Get schedule segments to draw status lines
-        segments = self._get_schedule_segments()
-        
-        # If we have segments, add the StatusLineDrawer flowable
-        if segments:
-            try:
-                # Create a StatusLineDrawer to draw the status lines on the grid
-                today_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                tomorrow_midnight = today_midnight + timedelta(days=1)
-                
-                status_drawer = StatusLineDrawer(
-                    schedule_segments=segments,
-                    start_time=today_midnight,
-                    end_time=tomorrow_midnight
-                )
-                
-                # Important: Position the drawer correctly
-                # The drawer will be added at the exact position where it's inserted in the elements list
-                elements.append(status_drawer)
-            except Exception as e:
-                # If there's an error drawing status lines, continue without them
-                print(f"Error drawing status lines: {e}")
-                
-        # Add space for the remarks section
-        elements.append(Spacer(1, 5*mm))
-    
-    def _get_schedule_segments(self) -> List[Dict[str, Any]]:
+    def _get_segments_for_day(self, day: datetime.date) -> List[Dict[str, Any]]:
         """
-        Get a list of schedule segments from the schedule data.
+        Filter segments to include only those on a specific day.
         
+        Args:
+            day: The day to filter segments for
+            
         Returns:
-            List of schedule segments with type, start_time, and end_time
+            List of segments on that day
         """
-        if not self.schedule_data:
-            return []
-            
-        segments = self.schedule_data.get('segments', [])
+        all_segments = self._get_schedule_segments()
+        day_segments = []
         
-        # Normalize the segments to ensure they have the required fields
-        normalized_segments = []
-        for segment in segments:
-            normalized_segment = {}
-            
-            # Get the activity type
-            activity_type = segment.get('type', '').lower()
-            normalized_segment['type'] = activity_type
-            
-            # Get start and end times
-            start_str = segment.get('start')
-            end_str = segment.get('end')
-            
-            if not start_str or not end_str:
-                continue
-                
-            try:
-                # Parse the ISO format strings to datetime objects
-                start_time = datetime.fromisoformat(start_str)
-                end_time = datetime.fromisoformat(end_str)
-                
-                normalized_segment['start_time'] = start_time
-                normalized_segment['end_time'] = end_time
-                
-                normalized_segments.append(normalized_segment)
-            except (ValueError, TypeError):
-                # Skip segments with invalid datetime formats
-                continue
-                
-        return normalized_segments
+        day_start = datetime.combine(day, datetime.min.time())
+        day_end = datetime.combine(day, datetime.max.time())
         
-    def _add_remarks_section(self, elements: List) -> None:
-        """Add remarks and shipping documents section."""
+        for segment in all_segments:
+            start_time = segment.get('start_time')
+            end_time = segment.get('end_time')
+            
+            if not start_time or not end_time:
+                continue
+            
+            # Check if segment overlaps with this day
+            if (start_time <= day_end and end_time >= day_start):
+                # Create a copy of the segment
+                day_segment = segment.copy()
+                
+                # Adjust segment to be within day boundaries
+                if start_time < day_start:
+                    day_segment['start_time'] = day_start
+                if end_time > day_end:
+                    day_segment['end_time'] = day_end
+                    
+                day_segments.append(day_segment)
+                
+        return day_segments
+
+    def _add_driver_log_grid(self, elements: List, day: datetime.date) -> None:
+        """
+        Add the driver log grid section to match FMCSA format.
+        
+        Args:
+            elements: List of elements to add to
+            day: The date for this log sheet
+        """
+        # Get schedule segments for this day
+        segments = self._get_segments_for_day(day)
+        day_start = datetime.combine(day, datetime.min.time())
+        day_end = datetime.combine(day, datetime.max.time())
+        
+        # Create a custom flowable to draw both grid and status lines
+        class DriverLogGrid(Flowable):
+            def __init__(self, pdf_generator, segments, day_start, day_end):
+                Flowable.__init__(self)
+                self.pdf_generator = pdf_generator
+                self.segments = segments
+                self.day_start = day_start
+                self.day_end = day_end
+                
+                # Dimensions for the complete grid with labels
+                self.width = pdf_generator.GRID_WIDTH + 25*mm
+                self.height = pdf_generator.GRID_HEIGHT + 10*mm + 15*mm  # Include hours row and remarks
+                
+                # Status rows (excluding REMARKS)
+                self.status_rows = [
+                    "Off Duty",
+                    "Sleeper Berth",
+                    "Driving",
+                    "On Duty (Not Driving)"
+                ]
+                
+            def draw(self):
+                canvas = self.canv
+                hour_labels_height = 10*mm
+                remarks_height = 15*mm
+                
+                # Draw hour labels
+                canvas.setFont('Helvetica', 8)
+                canvas.setFillColor(colors.black)
+                
+                # Draw column for status labels
+                label_width = 25*mm
+                
+                # Calculate grid dimensions
+                grid_width = self.pdf_generator.GRID_WIDTH
+                grid_height = self.pdf_generator.GRID_HEIGHT
+                hour_width = grid_width / 24
+                row_height = grid_height / 4  # 4 status rows
+                
+                # Draw hour markers
+                for hour in range(25):  # 0-24 hours
+                    x = label_width + hour * hour_width
+                    
+                    # Draw vertical line
+                    canvas.setLineWidth(0.5)
+                    if hour % 4 == 0:
+                        canvas.setLineWidth(1.0)  # Stronger line every 4 hours
+                    
+                    # Draw vertical grid line
+                    canvas.line(x, hour_labels_height, x, hour_labels_height + grid_height)
+                    
+                    # Draw hour label
+                    if hour == 0:
+                        label = "Midnight"
+                    elif hour == 12:
+                        label = "Noon"
+                    elif hour == 24:
+                        label = "Midnight"
+                    else:
+                        label = str(hour)
+                    
+                    canvas.drawCentredString(x, hour_labels_height - 8, label)
+                
+                # Draw status rows and horizontal grid lines
+                for i, status in enumerate(self.status_rows):
+                    y = hour_labels_height + grid_height - (i + 1) * row_height
+                    
+                    # Draw label
+                    canvas.setFont('Helvetica-Bold', 8)
+                    canvas.drawString(2, y + row_height/2 - 4, status)
+                    
+                    # Draw horizontal grid line
+                    canvas.setLineWidth(0.5)
+                    canvas.line(label_width, y, label_width + grid_width, y)
+                
+                # Draw remarks row
+                canvas.setFont('Helvetica-Bold', 8)
+                canvas.drawString(2, hour_labels_height - remarks_height + 5, "REMARKS")
+                
+                # Draw top horizontal line
+                canvas.setLineWidth(0.5)
+                canvas.line(label_width, hour_labels_height + grid_height, 
+                           label_width + grid_width, hour_labels_height + grid_height)
+                
+                # Draw status lines
+                drawer = StatusLineDrawer(
+                    schedule_segments=self.segments,
+                    start_time=self.day_start,
+                    end_time=self.day_end,
+                    canvas=canvas,
+                    x_offset=label_width,
+                    y_offset=hour_labels_height,
+                    grid_width=grid_width,
+                    grid_height=grid_height
+                )
+                drawer.draw()
+        
+        # Add the driver log grid flowable to elements
+        elements.append(DriverLogGrid(self, segments, day_start, day_end))
+        elements.append(Spacer(1, 5*mm))
+
+    def _add_remarks_section(self, elements: List, day: datetime.date) -> None:
+        """
+        Add remarks and shipping documents section.
+        
+        Args:
+            elements: List of elements to add to
+            day: The date for this log sheet
+        """
         styles = getSampleStyleSheet()
         normal_style = styles['Normal']
         
         # Create remarks section
         remarks_label = Paragraph("REMARKS", normal_style)
+        
+        # Generate remarks based on this day's activities
+        remarks = self._generate_remarks_for_day(day)
         
         # Pro or Shipping Number - use trip data if available
         shipping_no = ""
@@ -497,15 +652,18 @@ class PDFGenerator:
         
         pro_label = Paragraph("Pro or Shipping No. " + shipping_no, ParagraphStyle('ProLabel', parent=normal_style, fontSize=8))
         
+        # Add locations/cities for this day
+        locations_text = Paragraph(remarks, ParagraphStyle('LocationsText', parent=normal_style, fontSize=8, leading=10))
+        
         remarks_data = [
-            [remarks_label, ""],
+            [remarks_label, locations_text],
             ["", pro_label]
         ]
         
         remarks_table = Table(
             remarks_data,
             colWidths=[25*mm, 155*mm],
-            rowHeights=[10*mm, 30*mm],
+            rowHeights=[30*mm, 10*mm],
             style=TableStyle([
                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                 ('VALIGN', (1, 1), (1, 1), 'BOTTOM'),
@@ -518,13 +676,55 @@ class PDFGenerator:
         
         elements.append(remarks_table)
     
+    def _generate_remarks_for_day(self, day: datetime.date) -> str:
+        """
+        Generate remarks text for a specific day.
+        
+        Args:
+            day: The day to generate remarks for
+            
+        Returns:
+            Formatted remarks string
+        """
+        remarks = []
+        
+        # Add shipping information
+        if self.trip.id:
+            remarks.append(f"Trip #{self.trip.id}")
+        
+        # Add origin/destination
+        remarks.append(f"From: {self.trip.current_location} To: {self.trip.dropoff_location}")
+        
+        # Get segments for this day
+        segments = self._get_segments_for_day(day)
+        
+        # Add location changes based on segments
+        for segment in segments:
+            segment_type = segment.get('type', '').lower()
+            start_time = segment.get('start_time')
+            
+            # Only add location remarks for driving segments
+            if segment_type == 'drive' and start_time:
+                time_str = start_time.strftime("%H:%M")
+                remarks.append(f"{time_str} - Started driving")
+                
+        return "\n".join(remarks)
+        
     @classmethod
-    def generate_trip_log(cls, trip_id: int) -> bytes:
+    def generate_trip_log(cls, trip_id: int, 
+                         carrier_name: str = "Transport Company", 
+                         office_address: str = "123 Trucking Lane, Anytown, USA",
+                         vehicle_number: str = "",
+                         co_driver_name: str = "") -> bytes:
         """
         Generate a driver log PDF for a specific trip.
         
         Args:
             trip_id: The Trip ID to generate a log for
+            carrier_name: Name of the carrier company
+            office_address: Main office address
+            vehicle_number: Truck or tractor number
+            co_driver_name: Name of co-driver, if applicable
             
         Returns:
             PDF file as bytes
@@ -534,5 +734,11 @@ class PDFGenerator:
         except Trip.DoesNotExist:
             raise ValueError(f"Trip with ID {trip_id} not found")
             
-        generator = cls(trip)
+        generator = cls(
+            trip=trip,
+            carrier_name=carrier_name,
+            office_address=office_address,
+            vehicle_number=vehicle_number,
+            co_driver_name=co_driver_name
+        )
         return generator.generate_pdf() 
